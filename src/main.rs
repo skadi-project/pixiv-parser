@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, anyhow};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use futures::{StreamExt, stream};
+use indicatif::{ProgressBar, ProgressStyle};
 use reqwest::header::{
     CONTENT_LENGTH, CONTENT_TYPE, COOKIE, HeaderMap, HeaderValue, REFERER, USER_AGENT,
 };
@@ -10,6 +11,7 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::HashSet,
     path::{Path, PathBuf},
+    str::FromStr,
     time::Duration,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -18,20 +20,93 @@ const UA: &str =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126.0 Safari/537.36";
 const SCHEMA_VERSION: u32 = 1;
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, ValueEnum)]
+#[serde(rename_all = "lowercase")]
+enum SortOrder {
+    /// Newest first by numeric Pixiv work ID.
+    Id,
+    /// Oldest first by numeric Pixiv work ID.
+    Oldest,
+    /// Keep the order returned by the API.
+    Api,
+}
+
+impl FromStr for SortOrder {
+    type Err = String;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        match value.to_ascii_lowercase().as_str() {
+            "id" => Ok(Self::Id),
+            "oldest" => Ok(Self::Oldest),
+            "api" => Ok(Self::Api),
+            _ => Err("sort must be id, oldest, or api".into()),
+        }
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct FileConfig {
+    session: Option<String>,
+    out: Option<PathBuf>,
+    concurrency: Option<usize>,
+    delay_ms: Option<u64>,
+    limit: Option<usize>,
+    sort: Option<SortOrder>,
+    dry_run: Option<bool>,
+    json_summary: Option<bool>,
+    failed_file: Option<PathBuf>,
+    no_r18: Option<bool>,
+    resume: Option<bool>,
+    retry_failed: Option<bool>,
+}
+
+#[derive(Debug)]
+struct ResolvedConfig {
+    session: String,
+    out: PathBuf,
+    concurrency: usize,
+    delay_ms: u64,
+    limit: Option<usize>,
+    sort: SortOrder,
+    dry_run: bool,
+    json_summary: bool,
+    failed_file: Option<PathBuf>,
+    no_r18: bool,
+    resume: bool,
+    retry_failed: bool,
+}
+
 #[derive(Parser, Debug)]
 #[command(about = "Pixiv artist original-image downloader")]
 struct Args {
-    /// Full profile URL or numeric user ID
-    target: String,
+    /// Full profile URLs or numeric user IDs
+    #[arg(required = true)]
+    targets: Vec<String>,
+    /// TOML configuration file
+    #[arg(long)]
+    config: Option<PathBuf>,
     /// Falls back to SESSION from .env
     #[arg(long)]
     session: Option<String>,
     #[arg(long)]
     out: Option<PathBuf>,
-    #[arg(long, default_value_t = 4, value_parser = parse_concurrency)]
-    concurrency: usize,
+    #[arg(long, value_parser = parse_concurrency)]
+    concurrency: Option<usize>,
     #[arg(long)]
     delay_ms: Option<u64>,
+    #[arg(long, value_parser = parse_limit)]
+    limit: Option<usize>,
+    #[arg(long, value_enum)]
+    sort: Option<SortOrder>,
+    #[arg(long)]
+    dry_run: bool,
+    #[arg(long)]
+    json_summary: bool,
+    #[arg(long)]
+    failed_file: Option<PathBuf>,
+    #[arg(long)]
+    no_r18: bool,
     /// Reuse the persisted plan and verify all completed files
     #[arg(long, conflicts_with = "retry_failed")]
     resume: bool,
@@ -39,6 +114,7 @@ struct Args {
     #[arg(long, conflicts_with = "resume")]
     retry_failed: bool,
 }
+
 fn parse_concurrency(v: &str) -> std::result::Result<usize, String> {
     let n: usize = v.parse().map_err(|_| "Expected an integer from 1 to 32")?;
     if (1..=32).contains(&n) {
@@ -47,8 +123,146 @@ fn parse_concurrency(v: &str) -> std::result::Result<usize, String> {
         Err("Concurrency must be from 1 to 32".into())
     }
 }
-fn log(s: impl AsRef<str>) {
-    println!("{}", s.as_ref());
+
+fn parse_limit(v: &str) -> std::result::Result<usize, String> {
+    let n: usize = v.parse().map_err(|_| "Expected a positive integer")?;
+    if n > 0 {
+        Ok(n)
+    } else {
+        Err("Limit must be greater than zero".into())
+    }
+}
+
+fn log(s: impl AsRef<str>, enabled: bool) {
+    if enabled {
+        println!("{}", s.as_ref());
+    }
+}
+
+async fn load_file_config(path: Option<&Path>) -> Result<FileConfig> {
+    let Some(path) = path else {
+        return Ok(FileConfig::default());
+    };
+    let text = tokio::fs::read_to_string(path)
+        .await
+        .with_context(|| format!("Could not read config {}", path.display()))?;
+    toml::from_str(&text).context("Invalid TOML configuration")
+}
+
+fn env_string(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|value| !value.is_empty())
+}
+
+fn env_bool(name: &str) -> Result<Option<bool>> {
+    let Some(value) = env_string(name) else {
+        return Ok(None);
+    };
+    value
+        .parse::<bool>()
+        .map(Some)
+        .with_context(|| format!("{name} must be true or false"))
+}
+
+fn env_usize(name: &str) -> Result<Option<usize>> {
+    let Some(value) = env_string(name) else {
+        return Ok(None);
+    };
+    value
+        .parse::<usize>()
+        .map(Some)
+        .with_context(|| format!("{name} must be an integer"))
+}
+
+fn env_sort(name: &str) -> Result<Option<SortOrder>> {
+    let Some(value) = env_string(name) else {
+        return Ok(None);
+    };
+    value
+        .parse()
+        .map(Some)
+        .map_err(|error: String| anyhow!("{name}: {error}"))
+}
+
+async fn resolve_config(args: &Args, file: FileConfig) -> Result<ResolvedConfig> {
+    let session = args
+        .session
+        .clone()
+        .or(file.session)
+        .or_else(|| env_string("SESSION"))
+        .ok_or_else(|| anyhow!("Укажите --session, session в TOML или SESSION"))?;
+    let out = args
+        .out
+        .clone()
+        .or(file.out)
+        .or_else(|| env_string("OUT").map(PathBuf::from))
+        .unwrap_or_else(|| PathBuf::from("downloads"));
+    let concurrency = args
+        .concurrency
+        .or(file.concurrency)
+        .or(env_usize("CONCURRENCY")?)
+        .unwrap_or(4);
+    if !(1..=32).contains(&concurrency) {
+        return Err(anyhow!("Concurrency must be from 1 to 32"));
+    }
+    let delay_ms = args
+        .delay_ms
+        .or(file.delay_ms)
+        .or_else(|| env_string("DELAY_MS").and_then(|x| x.parse().ok()))
+        .unwrap_or(300);
+    let limit = args
+        .limit
+        .or(file.limit)
+        .or(env_usize("LIMIT")?)
+        .map(|value| {
+            if value == 0 {
+                Err(anyhow!("Limit must be greater than zero"))
+            } else {
+                Ok(value)
+            }
+        })
+        .transpose()?;
+    let sort = args
+        .sort
+        .or(file.sort)
+        .or(env_sort("SORT")?)
+        .unwrap_or(SortOrder::Id);
+    let dry_run = args.dry_run || file.dry_run.or(env_bool("DRY_RUN")?).unwrap_or(false);
+    let json_summary = args.json_summary
+        || file
+            .json_summary
+            .or(env_bool("JSON_SUMMARY")?)
+            .unwrap_or(false);
+    let failed_file = args
+        .failed_file
+        .clone()
+        .or(file.failed_file)
+        .or_else(|| env_string("FAILED_FILE").map(PathBuf::from));
+    let no_r18 = args.no_r18 || file.no_r18.or(env_bool("NO_R18")?).unwrap_or(false);
+    let resume = args.resume || file.resume.or(env_bool("RESUME")?).unwrap_or(false);
+    let retry_failed = args.retry_failed
+        || file
+            .retry_failed
+            .or(env_bool("RETRY_FAILED")?)
+            .unwrap_or(false);
+    if resume && retry_failed {
+        return Err(anyhow!(
+            "--resume and --retry-failed are mutually exclusive"
+        ));
+    }
+    Ok(ResolvedConfig {
+        session,
+        out,
+        concurrency,
+        delay_ms,
+        limit,
+        sort,
+        dry_run,
+        json_summary,
+        failed_file,
+        no_r18,
+        resume,
+        retry_failed,
+    })
 }
 fn retryable(error: &anyhow::Error) -> bool {
     error.downcast_ref::<reqwest::Error>().is_some_and(|e| {
@@ -119,7 +333,55 @@ fn tier_limit(n: usize) -> usize {
         192
     }
 }
-async fn fetch_all(c: &reqwest::Client, uid: &str) -> Result<Vec<u64>> {
+#[derive(Clone, Debug, PartialEq)]
+struct ProfileWork {
+    id: u64,
+    r18: Option<bool>,
+}
+
+fn explicit_r18(value: &Value) -> Option<bool> {
+    let object = value.as_object()?;
+    let mut explicit = None;
+    for key in ["is_r18", "r18"] {
+        match object.get(key) {
+            Some(Value::Bool(value)) if *value => return Some(true),
+            Some(Value::Bool(value)) => explicit = Some(*value),
+            Some(Value::Number(value)) if value.as_i64() == Some(1) => return Some(true),
+            Some(Value::Number(value)) if value.as_i64() == Some(0) => explicit = Some(false),
+            _ => {}
+        }
+    }
+    explicit
+}
+
+fn profile_is_allowed(value: &Value, no_r18: bool) -> bool {
+    !no_r18 || explicit_r18(value) != Some(true)
+}
+
+fn sort_profile_works(works: &mut [ProfileWork], sort: SortOrder) {
+    match sort {
+        SortOrder::Id => works.sort_unstable_by_key(|work| std::cmp::Reverse(work.id)),
+        SortOrder::Oldest => works.sort_unstable_by_key(|work| work.id),
+        SortOrder::Api => {}
+    }
+}
+
+fn limit_profile_works(works: Vec<ProfileWork>, limit: Option<usize>) -> Vec<ProfileWork> {
+    match limit {
+        Some(limit) => works.into_iter().take(limit).collect(),
+        None => {
+            let tier = tier_limit(works.len());
+            works.into_iter().take(tier).collect()
+        }
+    }
+}
+
+async fn fetch_all(
+    c: &reqwest::Client,
+    uid: &str,
+    sort: SortOrder,
+    no_r18: bool,
+) -> Result<Vec<ProfileWork>> {
     let v: Value = get_with_retry(
         c,
         &format!("https://www.pixiv.net/ajax/user/{uid}/profile/all"),
@@ -130,15 +392,23 @@ async fn fetch_all(c: &reqwest::Client, uid: &str) -> Result<Vec<u64>> {
     if v.get("error").and_then(Value::as_bool).unwrap_or(false) {
         return Err(anyhow!("Pixiv API error"));
     }
-    let mut ids: Vec<u64> = v
+    let mut works: Vec<ProfileWork> = v
         .pointer("/body/illusts")
         .and_then(Value::as_object)
         .ok_or_else(|| anyhow!("Unexpected profile response"))?
-        .keys()
-        .filter_map(|k| k.parse().ok())
+        .iter()
+        .filter_map(|(id, value)| {
+            let id = id.parse().ok()?;
+            let r18 = explicit_r18(value);
+            if !profile_is_allowed(value, no_r18) {
+                None
+            } else {
+                Some(ProfileWork { id, r18 })
+            }
+        })
         .collect();
-    ids.sort_unstable_by(|a, b| b.cmp(a));
-    Ok(ids)
+    sort_profile_works(&mut works, sort);
+    Ok(works)
 }
 async fn fetch_pages(c: &reqwest::Client, id: u64) -> Result<Vec<String>> {
     let v: Value = get_with_retry(c, &format!("https://www.pixiv.net/ajax/illust/{id}/pages"))
@@ -483,6 +753,29 @@ fn selected_tasks(
         })
         .collect()
 }
+#[derive(Debug, Default, PartialEq)]
+struct DownloadStats {
+    saved: usize,
+    skipped: usize,
+    failed: usize,
+}
+
+fn progress_bar(total: usize, label: String, enabled: bool) -> ProgressBar {
+    let bar = if enabled {
+        ProgressBar::new(total as u64)
+    } else {
+        ProgressBar::hidden()
+    };
+    bar.set_style(
+        ProgressStyle::with_template(
+            "{prefix} [{elapsed_precise}] {bar:30.cyan/blue} {pos}/{len} ({eta}) {msg}",
+        )
+        .expect("valid progress template"),
+    );
+    bar.set_prefix(label);
+    bar
+}
+
 async fn run_downloads(
     m: &mut Manifest,
     tasks: Vec<(usize, usize)>,
@@ -490,7 +783,8 @@ async fn run_downloads(
     client: &reqwest::Client,
     out: &Path,
     mp: &Path,
-) -> Result<usize> {
+    verbose: bool,
+) -> Result<DownloadStats> {
     let tasks: Vec<_> = tasks
         .into_iter()
         .map(|(wi, fi)| (wi, fi, m.works[wi].files[fi].clone()))
@@ -499,12 +793,17 @@ async fn run_downloads(
         m.works[*wi].files[*fi].status = FileStatus::Pending;
     }
     save_manifest(mp, m).await?;
+    let bar = progress_bar(
+        tasks.len(),
+        format!("Автор {}: файлы", m.author_id),
+        verbose,
+    );
     // One writer consumes completions while transfers are still in flight. No collect-all phase.
     let mut completions = stream::iter(tasks.into_iter().map(|(wi, fi, task)| async move {
         (wi, fi, download_original(client, &task, out).await)
     }))
     .buffer_unordered(concurrency);
-    let mut failed = 0;
+    let mut stats = DownloadStats::default();
     while let Some((wi, fi, result)) = completions.next().await {
         let f = &mut m.works[wi].files[fi];
         match result {
@@ -513,7 +812,8 @@ async fn run_downloads(
                 bytes,
                 sha256,
             }) => {
-                log(format!("saved {filename} ({bytes} bytes)"));
+                stats.saved += 1;
+                bar.set_message(format!("сохранён {filename} ({bytes} байт)"));
                 f.size = Some(bytes);
                 f.sha256 = Some(sha256);
                 f.status = FileStatus::Completed;
@@ -523,23 +823,30 @@ async fn run_downloads(
                 bytes,
                 sha256,
             }) => {
-                log(format!("verified {filename}"));
+                stats.skipped += 1;
+                bar.set_message(format!("проверен {filename}"));
                 f.size = Some(bytes);
                 f.sha256 = Some(sha256);
                 f.status = FileStatus::Completed;
             }
             Err(_) => {
                 // Never persist URL-bearing reqwest errors, credentials or server-provided text.
-                failed += 1;
+                stats.failed += 1;
                 f.status = FileStatus::Failed("Image transfer or verification failed".into());
-                log(format!("FAIL {}", f.path));
+                bar.println(format!("Ошибка загрузки: {}", f.path));
             }
         }
         save_manifest(mp, m)
             .await
             .context("Could not persist completed task")?;
+        bar.inc(1);
+        bar.set_message(format!(
+            "сохранено {} / проверено {} / ошибок {}",
+            stats.saved, stats.skipped, stats.failed
+        ));
     }
-    Ok(failed)
+    bar.finish_and_clear();
+    Ok(stats)
 }
 fn select_existing(m: &Manifest, retry: bool) -> Vec<u64> {
     m.works
@@ -554,29 +861,49 @@ fn select_existing(m: &Manifest, retry: bool) -> Vec<u64> {
         .map(|w| w.work_id)
         .collect()
 }
-#[tokio::main]
-async fn main() -> Result<()> {
-    dotenvy::dotenv().ok();
-    let a = Args::parse();
-    let session = a
-        .session
-        .or_else(|| std::env::var("SESSION").ok())
-        .ok_or_else(|| anyhow!("Укажите --session или SESSION"))?;
-    let uid = extract_user_id(&a.target)?;
-    let out = a
-        .out
-        .or_else(|| std::env::var("OUT").ok().map(PathBuf::from))
-        .unwrap_or_else(|| PathBuf::from("downloads"))
-        .join(&uid);
-    tokio::fs::create_dir_all(&out).await?;
+#[derive(Debug, Serialize, PartialEq)]
+struct AuthorSummary {
+    target: String,
+    author_id: Option<String>,
+    selected_works: usize,
+    planned_files: usize,
+    downloaded_files: usize,
+    skipped_files: usize,
+    file_failures: usize,
+    resolution_failures: usize,
+    status: String,
+}
+
+impl AuthorSummary {
+    fn failed(target: String) -> Self {
+        Self {
+            target,
+            author_id: None,
+            selected_works: 0,
+            planned_files: 0,
+            downloaded_files: 0,
+            skipped_files: 0,
+            file_failures: 0,
+            resolution_failures: 1,
+            status: "failed".into(),
+        }
+    }
+}
+
+async fn run_author(target: &str, config: &ResolvedConfig) -> Result<AuthorSummary> {
+    let uid = extract_user_id(target)?;
+    let out = config.out.join(&uid);
+    if !config.dry_run {
+        tokio::fs::create_dir_all(&out).await?;
+    }
     let mp = manifest_path(&out);
-    let api = client_with_headers(&session)?;
+    let api = client_with_headers(&config.session)?;
     let cdn = cdn_client()?;
     let mut m = match load_manifest(&mp, &uid).await {
         Ok(m) => m,
         Err(e)
-            if !a.resume
-                && !a.retry_failed
+            if !config.resume
+                && !config.retry_failed
                 && e.downcast_ref::<std::io::Error>()
                     .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
         {
@@ -588,12 +915,14 @@ async fn main() -> Result<()> {
         }
         Err(e) => return Err(e.context("Could not load author manifest")),
     };
-    let selected = if a.resume || a.retry_failed {
-        select_existing(&m, a.retry_failed)
+    let selected = if config.resume || config.retry_failed {
+        select_existing(&m, config.retry_failed)
     } else {
-        let ids = fetch_all(&api, &uid).await?;
-        let limit = tier_limit(ids.len());
-        ids.into_iter().take(limit).collect()
+        let works = fetch_all(&api, &uid, config.sort, config.no_r18).await?;
+        limit_profile_works(works, config.limit)
+            .into_iter()
+            .map(|work| work.id)
+            .collect()
     };
     // Commit every selected work ID before resolving URLs, so a crash preserves the plan.
     for id in &selected {
@@ -605,17 +934,26 @@ async fn main() -> Result<()> {
             });
         }
     }
-    save_manifest(&mp, &m).await?;
-    let delay = a
-        .delay_ms
-        .or_else(|| std::env::var("DELAY_MS").ok().and_then(|x| x.parse().ok()))
-        .unwrap_or(300);
+    if !config.dry_run {
+        save_manifest(&mp, &m).await?;
+    }
+    let resolve_count = m
+        .works
+        .iter()
+        .filter(|w| selected.contains(&w.work_id) && w.files.is_empty())
+        .count();
+    let resolve_bar = progress_bar(
+        resolve_count,
+        format!("Автор {uid}: страницы"),
+        !config.json_summary,
+    );
     let mut resolved_ids = Vec::new();
     for wi in 0..m.works.len() {
         let id = m.works[wi].work_id;
         if !selected.contains(&id) || !m.works[wi].files.is_empty() {
             continue;
         }
+        resolve_bar.set_message(format!("работа {id}"));
         match fetch_pages(&api, id)
             .await
             .and_then(|urls| planned_files(id, urls))
@@ -633,23 +971,115 @@ async fn main() -> Result<()> {
             }
             Err(_) => {
                 m.works[wi].status = FileStatus::Failed("Page resolution failed".into());
-                log(format!("FAIL resolving {id}"));
+                resolve_bar.println(format!("Ошибка получения страниц работы {id}"));
             }
         }
-        save_manifest(&mp, &m).await?;
-        tokio::time::sleep(Duration::from_millis(delay)).await;
+        if !config.dry_run {
+            save_manifest(&mp, &m).await?;
+        }
+        resolve_bar.inc(1);
+        tokio::time::sleep(Duration::from_millis(config.delay_ms)).await;
     }
-    let tasks = selected_tasks(&m, &selected, a.retry_failed, &resolved_ids);
-    let failures = run_downloads(&mut m, tasks, a.concurrency, &cdn, &out, &mp).await?;
-    let unresolved = m
+    resolve_bar.finish_and_clear();
+    let tasks = selected_tasks(&m, &selected, config.retry_failed, &resolved_ids);
+    let planned_files = tasks.len();
+    let stats = if config.dry_run {
+        DownloadStats::default()
+    } else {
+        run_downloads(
+            &mut m,
+            tasks,
+            config.concurrency,
+            &cdn,
+            &out,
+            &mp,
+            !config.json_summary,
+        )
+        .await?
+    };
+    let resolution_failures = m
         .works
         .iter()
         .filter(|w| selected.contains(&w.work_id) && matches!(w.status, FileStatus::Failed(_)))
         .count();
-    log(format!(
-        "Done: {failures} file failures, {unresolved} resolution failures"
-    ));
-    if failures + unresolved > 0 {
+    log(
+        format!(
+            "Done: {} file failures, {resolution_failures} resolution failures",
+            stats.failed
+        ),
+        !config.json_summary,
+    );
+    Ok(AuthorSummary {
+        target: target.into(),
+        author_id: Some(uid),
+        selected_works: selected.len(),
+        planned_files,
+        downloaded_files: stats.saved,
+        skipped_files: stats.skipped,
+        file_failures: stats.failed,
+        resolution_failures,
+        status: if config.dry_run {
+            "dry-run".into()
+        } else if stats.failed + resolution_failures > 0 {
+            "failed".into()
+        } else {
+            "ok".into()
+        },
+    })
+}
+
+async fn write_failed_file(path: &Path, summaries: &[AuthorSummary]) -> Result<()> {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    let failed: Vec<_> = summaries
+        .iter()
+        .filter(|summary| summary.status == "failed")
+        .map(|summary| {
+            serde_json::json!({
+                "target": summary.target,
+                "author_id": summary.author_id,
+                "resolution_failures": summary.resolution_failures,
+                "file_failures": summary.file_failures,
+            })
+        })
+        .collect();
+    tokio::fs::write(path, serde_json::to_vec_pretty(&failed)?).await?;
+    Ok(())
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    dotenvy::dotenv().ok();
+    let args = Args::parse();
+    let file = load_file_config(args.config.as_deref()).await?;
+    let config = resolve_config(&args, file).await?;
+    let mut summaries = Vec::with_capacity(args.targets.len());
+    for target in &args.targets {
+        match run_author(target, &config).await {
+            Ok(summary) => summaries.push(summary),
+            Err(error) => {
+                log(
+                    format!("FAIL {target}: author run failed"),
+                    !config.json_summary,
+                );
+                summaries.push(AuthorSummary::failed(target.clone()));
+                let _ = error;
+            }
+        }
+    }
+    if !config.dry_run
+        && let Some(path) = config.failed_file.as_deref()
+    {
+        write_failed_file(path, &summaries).await?;
+    }
+    if config.json_summary {
+        println!("{}", serde_json::to_string_pretty(&summaries)?);
+    }
+    if summaries.iter().any(|summary| summary.status == "failed") {
         return Err(anyhow!("Some tasks failed; use --retry-failed"));
     }
     Ok(())
@@ -659,15 +1089,99 @@ async fn main() -> Result<()> {
 mod tests {
     use super::*;
     #[test]
-    fn concurrency_bounds() {
-        for v in ["0", "33", "-1", "abc"] {
-            assert!(Args::try_parse_from(["app", "123", "--concurrency", v]).is_err());
-        }
-        for v in ["1", "4", "32"] {
-            assert!(Args::try_parse_from(["app", "123", "--concurrency", v]).is_ok());
-        }
-        assert!(Args::try_parse_from(["app", "123", "--resume", "--retry-failed"]).is_err());
+    fn config_toml_parses_stage4_options() {
+        let config: FileConfig = toml::from_str(
+            r#"
+            session = "from-file"
+            out = "archive"
+            concurrency = 2
+            delay_ms = 125
+            limit = 7
+            sort = "oldest"
+            dry_run = true
+            json_summary = true
+            failed_file = "failed.json"
+            no_r18 = true
+            "#,
+        )
+        .unwrap();
+        assert_eq!(config.session.as_deref(), Some("from-file"));
+        assert_eq!(config.limit, Some(7));
+        assert_eq!(config.sort, Some(SortOrder::Oldest));
+        assert!(config.dry_run.unwrap());
+        assert!(config.no_r18.unwrap());
     }
+
+    #[test]
+    fn limit_uses_explicit_value_or_tier() {
+        let works: Vec<_> = (1..=121).map(|id| ProfileWork { id, r18: None }).collect();
+        assert_eq!(limit_profile_works(works.clone(), Some(7)).len(), 7);
+        assert_eq!(limit_profile_works(works, None).len(), 96);
+    }
+
+    #[test]
+    fn sort_orders_id_oldest_and_api() {
+        let source = || {
+            vec![
+                ProfileWork { id: 3, r18: None },
+                ProfileWork { id: 1, r18: None },
+                ProfileWork { id: 2, r18: None },
+            ]
+        };
+        let mut newest = source();
+        sort_profile_works(&mut newest, SortOrder::Id);
+        assert_eq!(
+            newest.iter().map(|work| work.id).collect::<Vec<_>>(),
+            [3, 2, 1]
+        );
+        let mut oldest = source();
+        sort_profile_works(&mut oldest, SortOrder::Oldest);
+        assert_eq!(
+            oldest.iter().map(|work| work.id).collect::<Vec<_>>(),
+            [1, 2, 3]
+        );
+        let mut api = source();
+        sort_profile_works(&mut api, SortOrder::Api);
+        assert_eq!(
+            api.iter().map(|work| work.id).collect::<Vec<_>>(),
+            [3, 1, 2]
+        );
+    }
+
+    #[test]
+    fn args_accept_multiple_targets_and_stage4_flags() {
+        let args = Args::try_parse_from([
+            "app",
+            "123",
+            "https://www.pixiv.net/en/users/456",
+            "--limit",
+            "5",
+            "--sort",
+            "api",
+            "--no-r18",
+            "--dry-run",
+        ])
+        .unwrap();
+        assert_eq!(args.targets, ["123", "https://www.pixiv.net/en/users/456"]);
+        assert_eq!(args.limit, Some(5));
+        assert_eq!(args.sort, Some(SortOrder::Api));
+        assert!(args.no_r18 && args.dry_run);
+    }
+
+    #[test]
+    fn no_r18_only_excludes_explicit_true_metadata() {
+        let true_value = serde_json::json!({"is_r18": true});
+        let false_value = serde_json::json!({"r18": false});
+        let unknown_value = serde_json::json!({"title": "unknown"});
+        assert_eq!(explicit_r18(&true_value), Some(true));
+        assert_eq!(explicit_r18(&false_value), Some(false));
+        assert_eq!(explicit_r18(&unknown_value), None);
+        assert!(!profile_is_allowed(&true_value, true));
+        assert!(profile_is_allowed(&false_value, true));
+        assert!(profile_is_allowed(&unknown_value, true));
+        assert!(profile_is_allowed(&true_value, false));
+    }
+
     async fn mock_server(
         responses: Vec<&'static str>,
     ) -> (String, tokio::task::JoinHandle<Vec<String>>) {

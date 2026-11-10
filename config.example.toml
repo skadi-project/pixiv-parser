@@ -1,0 +1,14 @@
+# Copy this file to config.toml and set your session cookie.
+# CLI options override these values; these override matching .env values.
+session = "your_PHPSESSID"
+out = "downloads"
+concurrency = 4
+delay_ms = 300
+# limit = 96
+sort = "id" # id, oldest, or api
+dry_run = false
+json_summary = false
+# failed_file = "failed.json"
+no_r18 = false
+resume = false
+retry_failed = false
