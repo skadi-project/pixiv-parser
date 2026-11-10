@@ -1,14 +1,15 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use clap::Parser;
 use futures::stream::{self, StreamExt};
 use indicatif::{ProgressBar, ProgressStyle};
-use reqwest::header::{HeaderMap, HeaderValue, COOKIE, REFERER, USER_AGENT};
+use reqwest::header::{COOKIE, HeaderMap, HeaderValue, REFERER, USER_AGENT};
 use serde_json::Value;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use std::time::Instant;
+use tokio::io::AsyncWriteExt;
 
 /// Simple timestamped console logger, so it's clear what's happening and when.
 fn log(msg: impl AsRef<str>) {
@@ -38,12 +39,60 @@ struct Args {
     out: Option<PathBuf>,
 
     /// Max concurrent downloads
-    #[arg(long, default_value_t = 4)]
+    #[arg(long, default_value_t = 4, value_parser = parse_concurrency)]
     concurrency: usize,
 
     /// Delay between API calls in ms. Falls back to DELAY_MS from .env.
     #[arg(long)]
     delay_ms: Option<u64>,
+}
+
+fn parse_concurrency(value: &str) -> std::result::Result<usize, String> {
+    let value: usize = value
+        .parse()
+        .map_err(|_| "Expected an integer from 1 to 32")?;
+    if !(1..=32).contains(&value) {
+        return Err("Concurrency must be from 1 to 32".into());
+    }
+    Ok(value)
+}
+
+async fn get_with_retry(client: &reqwest::Client, url: &str) -> Result<reqwest::Response> {
+    for attempt in 0..4 {
+        let result = client
+            .get(url)
+            .send()
+            .await
+            .and_then(|r| r.error_for_status());
+        match result {
+            Ok(response) => return Ok(response),
+            Err(error) => {
+                let retryable = error.is_timeout()
+                    || error.is_connect()
+                    || error.is_body()
+                    || error.status().is_some_and(|s| {
+                        s.as_u16() == 408 || s.as_u16() == 429 || s.is_server_error()
+                    });
+                if !retryable || attempt == 3 {
+                    return Err(error.into());
+                }
+                tokio::time::sleep(Duration::from_secs(1 << attempt)).await;
+            }
+        }
+    }
+    unreachable!()
+}
+
+fn cdn_client() -> Result<reqwest::Client> {
+    Ok(reqwest::Client::builder()
+        .user_agent(UA)
+        .referer(true)
+        .default_headers(HeaderMap::from_iter([(
+            REFERER,
+            HeaderValue::from_static("https://www.pixiv.net/"),
+        )]))
+        .timeout(Duration::from_secs(30))
+        .build()?)
 }
 
 /// Extract a numeric user id from either a bare id or a full pixiv URL.
@@ -96,13 +145,7 @@ fn client_with_headers(session: &str) -> Result<reqwest::Client> {
 async fn fetch_all_illust_ids(client: &reqwest::Client, user_id: &str) -> Result<Vec<u64>> {
     let url = format!("https://www.pixiv.net/ajax/user/{user_id}/profile/all");
     log(format!("GET {url}"));
-    let resp: Value = client
-        .get(&url)
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?;
+    let resp: Value = get_with_retry(client, &url).await?.json().await?;
 
     if resp.get("error").and_then(Value::as_bool).unwrap_or(false) {
         let msg = resp
@@ -136,13 +179,7 @@ struct PageUrl {
 /// Get original-resolution page URLs for one illustration (handles multi-page works).
 async fn fetch_pages(client: &reqwest::Client, illust_id: u64) -> Result<Vec<PageUrl>> {
     let url = format!("https://www.pixiv.net/ajax/illust/{illust_id}/pages");
-    let resp: Value = client
-        .get(&url)
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?;
+    let resp: Value = get_with_retry(client, &url).await?.json().await?;
 
     if resp.get("error").and_then(Value::as_bool).unwrap_or(false) {
         let msg = resp
@@ -175,31 +212,81 @@ enum DownloadOutcome {
 async fn download_original(
     client: &reqwest::Client,
     page_url: &str,
-    out_dir: &PathBuf,
+    out_dir: &Path,
 ) -> Result<DownloadOutcome> {
-    let filename = page_url
-        .rsplit('/')
-        .next()
-        .unwrap_or("image.jpg")
+    let url = reqwest::Url::parse(page_url)?;
+    let filename = url
+        .path_segments()
+        .and_then(|mut s| s.next_back())
+        .filter(|s| !s.is_empty() && *s != "." && *s != ".." && !s.contains('\\'))
+        .ok_or_else(|| anyhow!("Invalid image filename"))?
         .to_string();
     let dest = out_dir.join(&filename);
     if dest.exists() {
         return Ok(DownloadOutcome::Skipped { filename });
     }
-
-    let bytes = client
-        .get(page_url)
-        .send()
-        .await?
-        .error_for_status()?
-        .bytes()
-        .await?;
-    let size = bytes.len() as u64;
-    tokio::fs::write(&dest, &bytes).await?;
-    Ok(DownloadOutcome::Saved {
-        filename,
-        bytes: size,
-    })
+    let part = out_dir.join(format!("{filename}.part"));
+    // Retry the entire transfer, including failures while reading the body.
+    for attempt in 0..4 {
+        let result: Result<u64> = async {
+            let mut response = client.get(page_url).send().await?.error_for_status()?;
+            let content_type = response
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|h| h.to_str().ok())
+                .unwrap_or("");
+            if !content_type
+                .split(';')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_ascii_lowercase()
+                .starts_with("image/")
+            {
+                return Err(anyhow!(
+                    "Expected image Content-Type, received {content_type:?}"
+                ));
+            }
+            let mut file = tokio::fs::File::create(&part).await?;
+            let mut size = 0;
+            while let Some(chunk) = response.chunk().await? {
+                file.write_all(&chunk).await?;
+                size += chunk.len() as u64;
+            }
+            file.flush().await?;
+            file.sync_all().await?;
+            drop(file);
+            tokio::fs::rename(&part, &dest).await?;
+            Ok(size)
+        }
+        .await;
+        match result {
+            Ok(bytes) => return Ok(DownloadOutcome::Saved { filename, bytes }),
+            Err(error) => {
+                match tokio::fs::remove_file(&part).await {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => {
+                        return Err(error.context(format!("Could not remove temporary file: {e}")));
+                    }
+                }
+                let retryable = error.downcast_ref::<reqwest::Error>().is_some_and(|e| {
+                    e.is_timeout()
+                        || e.is_connect()
+                        || e.is_body()
+                        || e.is_decode()
+                        || e.status().is_some_and(|s| {
+                            s.as_u16() == 408 || s.as_u16() == 429 || s.is_server_error()
+                        })
+                });
+                if !retryable || attempt == 3 {
+                    return Err(error);
+                }
+                tokio::time::sleep(Duration::from_secs(1 << attempt)).await;
+            }
+        }
+    }
+    unreachable!()
 }
 
 #[tokio::main]
@@ -232,6 +319,7 @@ async fn main() -> Result<()> {
     log(format!("Output directory: {}", out_dir.display()));
     log("Building HTTP client with session cookie...");
     let client = client_with_headers(&session)?;
+    let download_client = cdn_client()?;
 
     log("=== Stage 1/3: fetching illustration list ===");
     let all_ids = fetch_all_illust_ids(&client, &user_id).await?;
@@ -299,7 +387,7 @@ async fn main() -> Result<()> {
     let bar_ref = dl_bar.clone();
     stream::iter(all_page_urls)
         .for_each_concurrent(args.concurrency, |url| {
-            let client = client.clone();
+            let client = download_client.clone();
             let out_dir = download_dir.clone();
             let bar = bar_ref.clone();
             let saved_count = saved_count.clone();
@@ -362,4 +450,88 @@ async fn main() -> Result<()> {
     }
     log("Done.");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn concurrency_bounds() {
+        for value in ["0", "33", "-1", "abc"] {
+            assert!(Args::try_parse_from(["app", "123", "--concurrency", value]).is_err());
+        }
+        for value in ["1", "4", "32"] {
+            assert!(Args::try_parse_from(["app", "123", "--concurrency", value]).is_ok());
+        }
+    }
+
+    async fn mock_server(
+        responses: Vec<&'static str>,
+    ) -> (String, tokio::task::JoinHandle<Vec<String>>) {
+        use tokio::io::AsyncReadExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for response in responses {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = vec![0; 8192];
+                let n = socket.read(&mut request).await.unwrap();
+                requests.push(String::from_utf8_lossy(&request[..n]).to_string());
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+            requests
+        });
+        (format!("http://{address}/image.png"), task)
+    }
+
+    #[tokio::test]
+    async fn streams_retries_and_keeps_cookie_off_cdn() {
+        let (url, server) = mock_server(vec![
+            "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: 4\r\nConnection: close\r\n\r\ndata",
+        ]).await;
+        let dir = std::env::temp_dir().join(format!("pixiv-download-{}", std::process::id()));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        tokio::fs::write(dir.join("image.png.part"), b"stale")
+            .await
+            .unwrap();
+        let result = download_original(&cdn_client().unwrap(), &url, &dir)
+            .await
+            .unwrap();
+        assert!(matches!(result, DownloadOutcome::Saved { bytes: 4, .. }));
+        assert_eq!(
+            tokio::fs::read(dir.join("image.png")).await.unwrap(),
+            b"data"
+        );
+        assert!(!dir.join("image.png.part").exists());
+        for request in server.await.unwrap() {
+            assert!(!request.to_ascii_lowercase().contains("cookie:"));
+        }
+        assert!(matches!(
+            download_original(&cdn_client().unwrap(), &url, &dir)
+                .await
+                .unwrap(),
+            DownloadOutcome::Skipped { .. }
+        ));
+        tokio::fs::remove_dir_all(dir).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rejects_html_without_final_file() {
+        let (url, server) = mock_server(vec![
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 4\r\nConnection: close\r\n\r\noops",
+        ]).await;
+        let dir = std::env::temp_dir().join(format!("pixiv-html-{}", std::process::id()));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        assert!(
+            download_original(&cdn_client().unwrap(), &url, &dir)
+                .await
+                .is_err()
+        );
+        assert!(!dir.join("image.png").exists());
+        assert!(!dir.join("image.png.part").exists());
+        server.await.unwrap();
+        tokio::fs::remove_dir_all(dir).await.unwrap();
+    }
 }
