@@ -29,22 +29,21 @@ struct Args {
     /// e.g. https://www.pixiv.net/en/users/28480895  or  28480895
     target: String,
 
-    /// PHPSESSID cookie value (required for most content).
-    /// Can also be set via the PIXIV_SESSION env var.
+    /// PHPSESSID cookie value. Falls back to SESSION from .env.
     #[arg(long)]
     session: Option<String>,
 
-    /// Output directory
-    #[arg(long, default_value = "downloads")]
-    out: PathBuf,
+    /// Output directory. Falls back to OUT from .env.
+    #[arg(long)]
+    out: Option<PathBuf>,
 
     /// Max concurrent downloads
     #[arg(long, default_value_t = 4)]
     concurrency: usize,
 
-    /// Delay between API calls in ms (be polite, avoid bans)
-    #[arg(long, default_value_t = 300)]
-    delay_ms: u64,
+    /// Delay between API calls in ms. Falls back to DELAY_MS from .env.
+    #[arg(long)]
+    delay_ms: Option<u64>,
 }
 
 /// Extract a numeric user id from either a bare id or a full pixiv URL.
@@ -97,10 +96,19 @@ fn client_with_headers(session: &str) -> Result<reqwest::Client> {
 async fn fetch_all_illust_ids(client: &reqwest::Client, user_id: &str) -> Result<Vec<u64>> {
     let url = format!("https://www.pixiv.net/ajax/user/{user_id}/profile/all");
     log(format!("GET {url}"));
-    let resp: Value = client.get(&url).send().await?.error_for_status()?.json().await?;
+    let resp: Value = client
+        .get(&url)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
 
     if resp.get("error").and_then(Value::as_bool).unwrap_or(false) {
-        let msg = resp.get("message").and_then(Value::as_str).unwrap_or("unknown error");
+        let msg = resp
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown error");
         return Err(anyhow!("Pixiv API error: {msg}"));
     }
 
@@ -128,10 +136,19 @@ struct PageUrl {
 /// Get original-resolution page URLs for one illustration (handles multi-page works).
 async fn fetch_pages(client: &reqwest::Client, illust_id: u64) -> Result<Vec<PageUrl>> {
     let url = format!("https://www.pixiv.net/ajax/illust/{illust_id}/pages");
-    let resp: Value = client.get(&url).send().await?.error_for_status()?.json().await?;
+    let resp: Value = client
+        .get(&url)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
 
     if resp.get("error").and_then(Value::as_bool).unwrap_or(false) {
-        let msg = resp.get("message").and_then(Value::as_str).unwrap_or("unknown error");
+        let msg = resp
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown error");
         return Err(anyhow!("Pixiv API error for illust {illust_id}: {msg}"));
     }
 
@@ -143,7 +160,9 @@ async fn fetch_pages(client: &reqwest::Client, illust_id: u64) -> Result<Vec<Pag
     let out = pages
         .iter()
         .filter_map(|p| p.pointer("/urls/original").and_then(Value::as_str))
-        .map(|s| PageUrl { original: s.to_string() })
+        .map(|s| PageUrl {
+            original: s.to_string(),
+        })
         .collect();
     Ok(out)
 }
@@ -158,31 +177,59 @@ async fn download_original(
     page_url: &str,
     out_dir: &PathBuf,
 ) -> Result<DownloadOutcome> {
-    let filename = page_url.rsplit('/').next().unwrap_or("image.jpg").to_string();
+    let filename = page_url
+        .rsplit('/')
+        .next()
+        .unwrap_or("image.jpg")
+        .to_string();
     let dest = out_dir.join(&filename);
     if dest.exists() {
         return Ok(DownloadOutcome::Skipped { filename });
     }
 
-    let bytes = client.get(page_url).send().await?.error_for_status()?.bytes().await?;
+    let bytes = client
+        .get(page_url)
+        .send()
+        .await?
+        .error_for_status()?
+        .bytes()
+        .await?;
     let size = bytes.len() as u64;
     tokio::fs::write(&dest, &bytes).await?;
-    Ok(DownloadOutcome::Saved { filename, bytes: size })
+    Ok(DownloadOutcome::Saved {
+        filename,
+        bytes: size,
+    })
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    dotenvy::dotenv().ok();
     let args = Args::parse();
 
     let session = args
         .session
-        .or_else(|| std::env::var("PIXIV_SESSION").ok())
-        .ok_or_else(|| anyhow!("Provide --session <PHPSESSID> or set PIXIV_SESSION env var"))?;
+        .or_else(|| std::env::var("SESSION").ok())
+        .ok_or_else(|| anyhow!("Укажите --session или переменную SESSION в .env"))?;
+    let delay_ms = args
+        .delay_ms
+        .or_else(|| {
+            std::env::var("DELAY_MS")
+                .ok()
+                .and_then(|value| value.parse().ok())
+        })
+        .unwrap_or(300);
+    let out = args
+        .out
+        .or_else(|| std::env::var("OUT").ok().map(PathBuf::from))
+        .unwrap_or_else(|| PathBuf::from("downloads"));
 
     let user_id = extract_user_id(&args.target)?;
-    tokio::fs::create_dir_all(&args.out).await?;
+    let out_dir = out.join(&user_id);
+    tokio::fs::create_dir_all(&out_dir).await?;
 
     log(format!("Target user id: {user_id}"));
+    log(format!("Output directory: {}", out_dir.display()));
     log("Building HTTP client with session cookie...");
     let client = client_with_headers(&session)?;
 
@@ -222,7 +269,7 @@ async fn main() -> Result<()> {
             }
         }
         pages_bar.inc(1);
-        tokio::time::sleep(Duration::from_millis(args.delay_ms)).await;
+        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
     }
     pages_bar.finish_with_message("done");
 
@@ -233,7 +280,7 @@ async fn main() -> Result<()> {
         failed_illusts.len()
     ));
 
-    // --- Stage 3: download originals, with live progress + counters ---
+    // --- Stage 3: downloading originals, with live progress + counters ---
     log("=== Stage 3/3: downloading original images ===");
     let dl_bar = ProgressBar::new(all_page_urls.len() as u64);
     dl_bar.set_style(
@@ -248,12 +295,12 @@ async fn main() -> Result<()> {
     let failed_count = Arc::new(AtomicU64::new(0));
     let saved_bytes = Arc::new(AtomicU64::new(0));
 
-    let out_dir = args.out.clone();
+    let download_dir = out_dir.clone();
     let bar_ref = dl_bar.clone();
     stream::iter(all_page_urls)
         .for_each_concurrent(args.concurrency, |url| {
             let client = client.clone();
-            let out_dir = out_dir.clone();
+            let out_dir = download_dir.clone();
             let bar = bar_ref.clone();
             let saved_count = saved_count.clone();
             let skipped_count = skipped_count.clone();
@@ -291,9 +338,18 @@ async fn main() -> Result<()> {
     dl_bar.finish_with_message("done");
 
     log("=== Summary ===");
-    log(format!("  Saved:   {}", saved_count.load(Ordering::Relaxed)));
-    log(format!("  Skipped: {}", skipped_count.load(Ordering::Relaxed)));
-    log(format!("  Failed:  {}", failed_count.load(Ordering::Relaxed)));
+    log(format!(
+        "  Saved:   {}",
+        saved_count.load(Ordering::Relaxed)
+    ));
+    log(format!(
+        "  Skipped: {}",
+        skipped_count.load(Ordering::Relaxed)
+    ));
+    log(format!(
+        "  Failed:  {}",
+        failed_count.load(Ordering::Relaxed)
+    ));
     log(format!(
         "  Total downloaded: {:.2} MB",
         saved_bytes.load(Ordering::Relaxed) as f64 / (1024.0 * 1024.0)

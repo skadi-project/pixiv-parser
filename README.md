@@ -1,52 +1,99 @@
-# Pixiv artist original-image downloader
+# Загрузчик оригинальных изображений Pixiv
 
-## Setup
+Небольшая асинхронная CLI-утилита на Rust для скачивания оригинальных изображений выбранного автора Pixiv.
 
-1. Install Rust if you don't have it: https://rustup.rs
-2. Get your `PHPSESSID` cookie:
-   - Log into pixiv.net in your browser
-   - Open DevTools -> Application (Chrome) / Storage (Firefox) -> Cookies -> pixiv.net
-   - Copy the value of `PHPSESSID`
-3. Build:
-   ```
-   cargo build --release
-   ```
+## Установка
 
-## Usage
+1. Установите Rust: <https://rustup.rs>
+2. Получите значение cookie `PHPSESSID`:
+   - войдите на `pixiv.net` в браузере;
+   - откройте DevTools → Application/Storage → Cookies → `pixiv.net`;
+   - скопируйте значение cookie `PHPSESSID`.
+3. Создайте файл `.env` рядом с `Cargo.toml` на основе [.env.example](.env.example).
+4. Заполните в нём значение `SESSION`.
+5. Соберите проект:
 
+```bash
+cargo build --release
 ```
-export PIXIV_SESSION="your_phpsessid_value"
+
+## Настройка через `.env`
+
+```env
+SESSION=ваше_значение_PHPSESSID
+DELAY_MS=300
+OUT=downloads
+```
+
+Переменные:
+
+- `SESSION` — значение cookie `PHPSESSID`;
+- `DELAY_MS` — задержка между запросами к API в миллисекундах;
+- `OUT` — корневой каталог для сохранения изображений.
+
+Для каждого автора автоматически создаётся отдельный подкаталог с его ID. Например, при `OUT=downloads` и ID `28480895` файлы будут сохранены в `downloads/28480895/`.
+
+Файл `.env` добавлен в `.gitignore`, поэтому секрет cookie не попадёт в Git. Не публикуйте его и не передавайте другим пользователям.
+
+## Использование
+
+Передайте URL профиля или числовой ID автора:
+
+```bash
 cargo run --release -- https://www.pixiv.net/en/users/28480895
 ```
 
-or pass the id directly:
+Или:
 
+```bash
+cargo run --release -- 28480895
 ```
-cargo run --release -- 28480895 --session your_phpsessid_value --out ./downloads
+
+CLI-параметры могут переопределить значения из `.env`:
+
+```bash
+cargo run --release -- 28480895 \
+  --session другое_значение_PHPSESSID \
+  --delay-ms 500 \
+  --out ./my-downloads \
+  --concurrency 2
 ```
 
-## Tiers implemented
+В этом случае изображения будут сохранены в `./my-downloads/28480895/`.
 
-- total illustrations < 120  -> download newest 48
-- 120 <= total <= 300        -> download newest 96
-- total > 300                -> download newest 192
+Параметры:
 
-(Your original spec had a gap between 200 and 300 — I filled it by extending
-the 96-tier up to 300. Change `tier_limit()` in main.rs if you meant something
-else, e.g. a distinct 200-300 tier.)
+- `--session` — переопределяет `SESSION`;
+- `--delay-ms` — переопределяет `DELAY_MS`;
+- `--out` — переопределяет `OUT`;
+- `--concurrency` — максимальное количество одновременных скачиваний, по умолчанию `4`.
 
-## Notes / caveats
+Если `DELAY_MS` или `OUT` не указаны, используются значения по умолчанию: `300` миллисекунд и `downloads` соответственно.
 
-- Pixiv's Terms of Service prohibit automated scraping. This is intended for
-  personal archiving of your own bookmarks/follows, run at a low rate — not
-  for redistribution or public-facing tools.
-- The `/ajax/user/{id}/profile/all` endpoint returns *all* illust ids with no
-  reliable "created date" sort baked in, so this sorts by numeric id
-  descending, which is a good proxy for "newest first" but not perfectly
-  exact around bulk-uploaded works.
-- R-18 works generally won't resolve without a valid, logged-in session.
-- No retry/backoff logic is included — if you hit 429s, raise `--delay-ms`
-  and lower `--concurrency`.
-- Filenames are taken directly from pixiv's CDN URL (e.g.
-  `12345678_p0.png`), so multi-page works land as separate files in the same
-  folder automatically.
+## Лимиты загрузки
+
+Количество работ выбирается автоматически:
+
+- менее 120 иллюстраций — скачиваются 48 последних;
+- от 120 до 300 включительно — скачиваются 96 последних;
+- более 300 иллюстраций — скачиваются 192 последние.
+
+Сортировка выполняется по числовому ID работы в обратном порядке. Это приближённый способ выбрать новые работы: ID Pixiv обычно растут со временем, но не гарантируют точный порядок публикации.
+
+Многостраничные работы сохраняются отдельными файлами в каталоге автора. Имена берутся из URL Pixiv CDN, например `12345678_p0.png`.
+
+Итоговая структура каталогов:
+
+```text
+OUT/
+└── <ID_автора>/
+    ├── 12345678_p0.png
+    └── 12345678_p1.png
+```
+
+## Ограничения и предупреждения
+
+- Автоматизированный сбор данных может ограничиваться Условиями использования Pixiv. Используйте программу только для личного архива и не распространяйте скачанные материалы без разрешения правообладателей.
+- Для R-18 и другого закрытого содержимого требуется действующая авторизованная сессия.
+- В текущей версии нет автоматических повторных попыток и backoff при ошибках сети или ответах `429`.
+- При повторном запуске уже существующие файлы пропускаются.
