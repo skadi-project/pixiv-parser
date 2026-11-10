@@ -1,3 +1,0 @@
-cargo run --release -- id --session your_phpsessid_value --out ./downloads
-
-pixiv_scraper 1494798 --session 125741731_dBI99lcnG2MOrAEfAn0dCS2xiRhYdzrU --delay-ms 500 --out downloads/1494798
