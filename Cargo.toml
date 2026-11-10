@@ -13,3 +13,4 @@ anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 indicatif = "0.17"
 dotenvy = "0.15"
+sha2 = "0.10"
